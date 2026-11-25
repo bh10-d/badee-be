@@ -104,10 +104,15 @@ export class PrintersController {
 
     const upstream = client.get(
       streamUrl,
-      { timeout: 10_000, rejectUnauthorized: false },
+      { timeout: 15_000, rejectUnauthorized: false },
       (upstreamRes) => {
+        upstreamRes.on('error', () => {
+          if (!res.writableEnded) res.end();
+        });
         if (!upstreamRes.statusCode || upstreamRes.statusCode >= 400) {
-          res.status(upstreamRes.statusCode ?? 502).end('Camera stream unavailable');
+          if (!res.headersSent) {
+            res.status(upstreamRes.statusCode ?? 502).end('Camera stream unavailable');
+          }
           upstreamRes.resume();
           return;
         }
@@ -119,12 +124,25 @@ export class PrintersController {
       },
     );
 
+    upstream.on('timeout', () => {
+      upstream.destroy();
+      if (!res.headersSent) {
+        res.status(504).end('Upstream camera timeout');
+      } else if (!res.writableEnded) {
+        res.end();
+      }
+    });
+
     upstream.on('error', () => {
       if (!res.headersSent) {
         res.status(502).end('Upstream camera unreachable');
-      } else {
+      } else if (!res.writableEnded) {
         res.end();
       }
+    });
+
+    res.on('error', () => {
+      upstream.destroy();
     });
 
     req.on('close', () => {

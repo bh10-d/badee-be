@@ -204,7 +204,9 @@ export class ElegooCc1Driver extends EventEmitter implements IPrinterDriver {
   }
 
   async setLight(on: boolean): Promise<void> {
-    this.sendSdcp(403, { LightStatus: { SecondLight: on ? 1 : 0 } });
+    this.sendSdcp(403, { LightStatus: { SecondLight: on ? 1 : 0, RgbLight: [0, 0, 0] } });
+    this.state.lightOn = on;
+    this.emitState();
   }
 
   async home(axes: 'all' | 'xy' | 'z' = 'all'): Promise<void> {

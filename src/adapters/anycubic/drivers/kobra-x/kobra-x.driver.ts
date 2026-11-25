@@ -441,7 +441,24 @@ export class AnycubicKobraXDriver extends EventEmitter implements IPrinterDriver
   }
 
   async setLight(on: boolean): Promise<void> {
-    this.publishControl('light', 'update', { status: on ? 1 : 0 });
+    const data = { type: 2, status: on ? 1 : 0, brightness: on ? 100 : 0 };
+    this.publishControl('light', 'update', data);
+    if (this.client && this.modelId && this.deviceId) {
+      const webTopic = `anycubic/anycubicCloud/v1/web/printer/${this.modelId}/${this.deviceId}/light`;
+      this.client.publish(
+        webTopic,
+        JSON.stringify({
+          type: 'light',
+          action: 'update',
+          timestamp: Date.now(),
+          msgid: randomBytes(8).toString('hex'),
+          data,
+        }),
+        { qos: 1 },
+      );
+    }
+    this.state.lightOn = on;
+    this.emitState();
   }
 
   async move(axis: 'x' | 'y' | 'z', deltaMm: number): Promise<void> {
