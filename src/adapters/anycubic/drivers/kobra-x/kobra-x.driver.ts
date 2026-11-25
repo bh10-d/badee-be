@@ -1,5 +1,5 @@
 import { EventEmitter } from 'events';
-import { randomBytes } from 'crypto';
+import { createDecipheriv, createHash, randomBytes } from 'crypto';
 import mqtt, { type MqttClient } from 'mqtt';
 import type {
   DriverInitConfig,
@@ -11,6 +11,94 @@ import type {
 
 const MAX_NOZZLE_TEMP = 300;
 const MAX_BED_TEMP = 110;
+
+export interface AnycubicCtrlCredentials {
+  broker?: string;
+  username?: string;
+  password?: string;
+  deviceId?: string;
+  clientCertPem?: string;
+  clientKeyPem?: string;
+}
+
+/**
+ * Computes Anycubic LAN Mode `/ctrl` request signature:
+ * `md5(md5(token[0:16]) + ts + nonce)` (lowercase hex).
+ */
+export function computeAnycubicCtrlSign(token: string, ts: string, nonce: string): string {
+  const signKey = token.slice(0, 16);
+  const inner = createHash('md5').update(signKey, 'utf8').digest('hex');
+  return createHash('md5').update(`${inner}${ts}${nonce}`, 'utf8').digest('hex');
+}
+
+/**
+ * Decrypts Anycubic LAN Mode `/ctrl` AES-128-CBC response (`data.info`) using `token[16:32]`
+ * as the 16-byte AES key and `data.token` as IV source.
+ */
+export function decryptAnycubicCtrlInfo(
+  encryptedInfo: string,
+  baseToken: string,
+  ivToken?: string,
+): AnycubicCtrlCredentials | null {
+  if (!encryptedInfo || baseToken.length < 32) return null;
+  const key = Buffer.from(baseToken.slice(16, 32), 'utf8');
+  const ivCandidates: Buffer[] = [];
+  if (ivToken && ivToken.length >= 16) {
+    ivCandidates.push(Buffer.from(ivToken.slice(0, 16), 'utf8'));
+    ivCandidates.push(Buffer.from(ivToken.slice(-16), 'utf8'));
+    ivCandidates.push(createHash('md5').update(ivToken, 'utf8').digest());
+  }
+  ivCandidates.push(Buffer.from(baseToken.slice(0, 16), 'utf8'));
+  ivCandidates.push(key);
+  ivCandidates.push(Buffer.alloc(16, 0));
+
+  const encodings: Array<'base64' | 'hex'> = ['base64', 'hex'];
+
+  for (const enc of encodings) {
+    let cipherBuf: Buffer;
+    try {
+      cipherBuf = Buffer.from(encryptedInfo, enc);
+      if (cipherBuf.length === 0 || cipherBuf.length % 16 !== 0) continue;
+    } catch {
+      continue;
+    }
+
+    for (const iv of ivCandidates) {
+      if (iv.length !== 16) continue;
+      try {
+        const decipher = createDecipheriv('aes-128-cbc', key, iv);
+        const plain = Buffer.concat([decipher.update(cipherBuf), decipher.final()]).toString('utf8');
+        const parsed = JSON.parse(plain) as Record<string, unknown>;
+        return {
+          broker: typeof parsed.broker === 'string' ? parsed.broker : undefined,
+          username: typeof parsed.username === 'string' ? parsed.username : undefined,
+          password: typeof parsed.password === 'string' ? parsed.password : undefined,
+          deviceId:
+            typeof parsed.deviceId === 'string'
+              ? parsed.deviceId
+              : typeof parsed.device_id === 'string'
+                ? parsed.device_id
+                : undefined,
+          clientCertPem:
+            typeof parsed.cert === 'string'
+              ? parsed.cert
+              : typeof parsed.clientCert === 'string'
+                ? parsed.clientCert
+                : undefined,
+          clientKeyPem:
+            typeof parsed.key === 'string'
+              ? parsed.key
+              : typeof parsed.clientKey === 'string'
+                ? parsed.clientKey
+                : undefined,
+        };
+      } catch {
+        /* try next IV/encoding candidate */
+      }
+    }
+  }
+  return null;
+}
 
 interface KobraXCredentials {
   lanToken?: string;
@@ -109,7 +197,11 @@ export class AnycubicKobraXDriver extends EventEmitter implements IPrinterDriver
     this.discardClient();
     this.setConnectionState('connecting');
 
-    // Probe LAN Mode control endpoint (:18910/info) with strict timeout
+    // 1. Probe LAN Mode discovery endpoint (:18910/info) + signed /ctrl credential handshake
+    let brokerUrl = `mqtts://${this.ip}:9883`;
+    let infoToken = '';
+    let ctrlInfoUrl = `http://${this.ip}:18910/ctrl`;
+
     try {
       const controller = new AbortController();
       const timeout = setTimeout(() => controller.abort(), 5000);
@@ -131,18 +223,23 @@ export class AnycubicKobraXDriver extends EventEmitter implements IPrinterDriver
         if (discoveredModelId !== undefined && discoveredModelId !== null) {
           this.modelId = String(discoveredModelId);
         }
-        if (typeof info.token === 'string' && info.token && !this.creds.lanToken) {
-          this.creds.lanToken = info.token;
-          if (!this.cameraOverride) {
-            this.state.camera = {
-              available: true,
-              streamUrl: `http://${this.ip}:18088/live/${encodeURIComponent(info.token)}`,
-              protocol: 'flv',
-            };
+        if (typeof info.ctrlInfoUrl === 'string' && info.ctrlInfoUrl.startsWith(`http://${this.ip}:`)) {
+          ctrlInfoUrl = info.ctrlInfoUrl;
+        }
+        if (typeof info.token === 'string' && info.token) {
+          infoToken = info.token;
+          if (!this.creds.lanToken) {
+            this.creds.lanToken = info.token;
+            if (!this.cameraOverride) {
+              this.state.camera = {
+                available: true,
+                streamUrl: `http://${this.ip}:18088/live/${encodeURIComponent(info.token)}`,
+                protocol: 'flv',
+              };
+            }
           }
         }
-        // Printer is reachable on LAN (:18910/info OK)
-        this.state.statusText = 'LAN Ready (Connecting MQTT...)';
+        this.state.statusText = 'LAN Ready (Authenticating...)';
         this.emitState();
       }
     } catch (err) {
@@ -159,8 +256,67 @@ export class AnycubicKobraXDriver extends EventEmitter implements IPrinterDriver
 
     if (this.stopped) return;
 
+    // 2. Perform signed POST /ctrl handshake to dynamically obtain local MQTT username/password
+    if (infoToken.length >= 32 && !this.creds.mqttUsername) {
+      try {
+        const ts = String(Date.now());
+        const nonce = randomBytes(3).toString('hex');
+        const did = randomBytes(16).toString('hex');
+        const sign = computeAnycubicCtrlSign(infoToken, ts, nonce);
+        const ctrlUrl = `${ctrlInfoUrl}?ts=${encodeURIComponent(ts)}&nonce=${encodeURIComponent(nonce)}&sign=${encodeURIComponent(sign)}&did=${encodeURIComponent(did)}`;
+
+        const ctrlRes = await fetch(ctrlUrl, {
+          method: 'POST',
+          signal: AbortSignal.timeout(5000),
+        });
+        if (ctrlRes.ok) {
+          const ctrlJson = (await ctrlRes.json().catch(() => ({}))) as Record<string, unknown>;
+          const dataObj =
+            ctrlJson.data && typeof ctrlJson.data === 'object'
+              ? (ctrlJson.data as Record<string, unknown>)
+              : ctrlJson;
+
+          if (typeof dataObj.info === 'string') {
+            const decrypted = decryptAnycubicCtrlInfo(
+              dataObj.info,
+              infoToken,
+              typeof dataObj.token === 'string' ? dataObj.token : undefined,
+            );
+            if (decrypted) {
+              if (decrypted.broker && decrypted.broker.includes(this.ip)) {
+                brokerUrl = decrypted.broker;
+              }
+              if (decrypted.username) this.creds.mqttUsername = decrypted.username;
+              if (decrypted.password) this.creds.mqttPassword = decrypted.password;
+              if (decrypted.clientCertPem) this.creds.clientCertPem = decrypted.clientCertPem;
+              if (decrypted.clientKeyPem) this.creds.clientKeyPem = decrypted.clientKeyPem;
+              if (decrypted.deviceId && decrypted.deviceId !== this.deviceId) {
+                this.deviceId = decrypted.deviceId;
+                this.state.serialNumber = decrypted.deviceId;
+                this.emit('sn', decrypted.deviceId);
+              }
+            } else {
+              this.emit('event', {
+                level: 'warn',
+                type: 'ctrl_decrypt_failed',
+                message: `Kobra X /ctrl returned encrypted credentials that could not be decrypted`,
+              });
+            }
+          }
+        }
+      } catch (err) {
+        this.emit('event', {
+          level: 'warn',
+          type: 'ctrl_handshake_failed',
+          message: `Kobra X /ctrl handshake failed: ${(err as Error).message}`,
+        });
+      }
+    }
+
+    if (this.stopped) return;
+
     const clientId = `printfarm_${randomBytes(6).toString('hex')}`;
-    this.client = mqtt.connect(`mqtts://${this.ip}:9883`, {
+    this.client = mqtt.connect(brokerUrl, {
       clientId,
       username: this.creds.mqttUsername || undefined,
       password: this.creds.mqttPassword || this.creds.lanToken || undefined,
