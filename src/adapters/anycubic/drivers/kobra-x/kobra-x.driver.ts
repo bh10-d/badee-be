@@ -127,9 +127,23 @@ export class AnycubicKobraXDriver extends EventEmitter implements IPrinterDriver
           this.state.serialNumber = discoveredId;
           this.emit('sn', discoveredId);
         }
-        if (typeof info.model_id === 'string') {
-          this.modelId = info.model_id;
+        const discoveredModelId = info.modelId ?? info.model_id;
+        if (discoveredModelId !== undefined && discoveredModelId !== null) {
+          this.modelId = String(discoveredModelId);
         }
+        if (typeof info.token === 'string' && info.token && !this.creds.lanToken) {
+          this.creds.lanToken = info.token;
+          if (!this.cameraOverride) {
+            this.state.camera = {
+              available: true,
+              streamUrl: `http://${this.ip}:18088/live/${encodeURIComponent(info.token)}`,
+              protocol: 'flv',
+            };
+          }
+        }
+        // Printer is reachable on LAN (:18910/info OK)
+        this.state.statusText = 'LAN Ready (Connecting MQTT...)';
+        this.emitState();
       }
     } catch (err) {
       if (this.stopped) return;

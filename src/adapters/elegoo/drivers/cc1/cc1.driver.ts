@@ -1,6 +1,6 @@
 import { EventEmitter } from 'events';
 import { randomUUID } from 'crypto';
-import WebSocket from 'ws';
+import { WebSocket, type RawData } from 'ws';
 import type {
   DriverInitConfig,
   IPrinterDriver,
@@ -139,7 +139,7 @@ export class ElegooCc1Driver extends EventEmitter implements IPrinterDriver {
       }, 5_000);
     });
 
-    ws.on('message', (raw: WebSocket.RawData) => {
+    ws.on('message', (raw: RawData) => {
       const text = raw.toString('utf8').trim();
       if (!text || text === 'pong') return;
       this.handleMessage(text);

@@ -1,7 +1,7 @@
 import { EventEmitter } from 'events';
 import { randomBytes } from 'crypto';
 import mqtt, { type MqttClient } from 'mqtt';
-import WebSocket from 'ws';
+import { WebSocket } from 'ws';
 import type {
   DriverInitConfig,
   IPrinterDriver,
