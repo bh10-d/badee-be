@@ -28,6 +28,17 @@ describe('LanDiscoveryService parsers & SSRF guards', () => {
       firmware: 'V1.2.8',
       protocol: 'sdcp-udp',
     });
+
+    const cc1Packet = JSON.stringify({
+      Data: {
+        Name: 'Centauri Carbon',
+        MachineName: 'Centauri Carbon',
+        MainboardIP: '192.168.10.110',
+        MainboardID: '045715940107202800007c0000000000',
+        FirmwareVersion: 'V1.6.49',
+      },
+    });
+    expect(parseElegooSdcpPacket(cc1Packet, '192.168.10.110')?.model).toBe('cc1');
   });
 
   it('parses Anycubic LAN HTTP :18910/info response into unified printer metadata', () => {
@@ -50,6 +61,28 @@ describe('LanDiscoveryService parsers & SSRF guards', () => {
       name: 'Workshop Kobra X',
       serialNumber: 'AC-KX-5511',
       firmware: '2.3.5',
+      protocol: 'anycubic-lan-http',
+    });
+
+    // Real Kobra 3 / S1 / Kobra X LAN Mode :18910/info JSON shape
+    const realLanInfo = parseAnycubicInfoResponse(
+      {
+        ctrlType: 'lan',
+        token: 'tok123',
+        ctrlInfoUrl: 'http://192.168.10.207:18910/ctrl',
+        modelId: 20025,
+        cn: 'SERIAL123',
+        usn: 'uuid:fdm:20025',
+      },
+      '192.168.10.207',
+    );
+    expect(realLanInfo).toEqual({
+      ip: '192.168.10.207',
+      brand: 'anycubic',
+      model: 'kobra-x',
+      name: 'Anycubic Kobra (20025)',
+      serialNumber: 'SERIAL123',
+      firmware: null,
       protocol: 'anycubic-lan-http',
     });
   });

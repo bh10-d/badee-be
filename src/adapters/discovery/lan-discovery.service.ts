@@ -1,5 +1,6 @@
 import { Injectable, Logger } from '@nestjs/common';
 import * as dgram from 'node:dgram';
+import * as net from 'node:net';
 import * as os from 'node:os';
 import { isAllowedPrinterIp } from '../../common/network.util';
 
@@ -46,22 +47,35 @@ export function normalizePrivateSubnet(raw: string): string | null {
   return prefix;
 }
 
+const VIRTUAL_IFACE_PATTERN =
+  /vethernet|wsl|docker|hyper-v|vmware|virtualbox|vbox|tailscale|zerotier|hamachi|loopback|utun|br-/i;
+
 /**
- * Auto-detects private IPv4 /24 subnets attached to the local machine's LAN/Wi-Fi interfaces.
+ * Auto-detects private IPv4 /24 subnets attached to physical LAN/Wi-Fi interfaces,
+ * filtering out WSL/Docker/Hyper-V virtual adapters that waste scan budget.
  */
 export function detectLocalSubnets(): string[] {
   const ifaces = os.networkInterfaces();
-  const prefixes = new Set<string>();
-  for (const entries of Object.values(ifaces)) {
+  const physical = new Set<string>();
+  const fallback = new Set<string>();
+
+  for (const [name, entries] of Object.entries(ifaces)) {
     if (!entries) continue;
+    const isVirtual = VIRTUAL_IFACE_PATTERN.test(name);
     for (const addr of entries) {
       if (addr.family !== 'IPv4' || addr.internal) continue;
       const prefix = normalizePrivateSubnet(addr.address);
-      if (prefix) prefixes.add(prefix);
+      if (!prefix) continue;
+      if (isVirtual) fallback.add(prefix);
+      else physical.add(prefix);
     }
   }
-  // Cap to at most 2 local /24 subnets so scans stay fast (< 3s)
-  return Array.from(prefixes).slice(0, 2);
+
+  const chosen = physical.size > 0 ? Array.from(physical) : Array.from(fallback);
+  // Prioritize 192.168.x home/workshop LANs first, capped at 2 subnets
+  return chosen
+    .sort((a, b) => (a.startsWith('192.168.') ? -1 : b.startsWith('192.168.') ? 1 : a.localeCompare(b)))
+    .slice(0, 2);
 }
 
 /**
@@ -90,8 +104,12 @@ export function parseElegooSdcpPacket(raw: string, fallbackIp: string): Discover
 
     const rawName = (data.Name || data.MachineName || 'Elegoo Printer').trim();
     const lowerMachine = `${data.MachineName ?? ''} ${rawName}`.toLowerCase();
-    const model =
-      lowerMachine.includes('centauri') || lowerMachine.includes('cc2') ? 'cc2' : 'cc2';
+    // Distinguish Centauri Carbon 2 (CC2 — MQTT :1883) vs Centauri Carbon (CC1 — SDCP WS :3030)
+    const isCc2 =
+      lowerMachine.includes('cc2') ||
+      lowerMachine.includes('carbon 2') ||
+      lowerMachine.includes('carbon2');
+    const model = isCc2 ? 'cc2' : 'cc1';
 
     return {
       ip,
@@ -112,6 +130,8 @@ export function parseElegooSdcpPacket(raw: string, fallbackIp: string): Discover
 
 /**
  * Parses an Anycubic LAN Mode HTTP `:18910/info` JSON response.
+ * Real Anycubic Kobra 3 / S1 / Kobra X firmware returns:
+ * `{ ctrlType: "lan", token: "...", ctrlInfoUrl: "http://<ip>:18910/ctrl", modelId: 20025, cn: "...", usn: "uuid:fdm:..." }`
  */
 export function parseAnycubicInfoResponse(
   payload: unknown,
@@ -122,23 +142,37 @@ export function parseAnycubicInfoResponse(
   const nested =
     obj.data && typeof obj.data === 'object' ? (obj.data as Record<string, unknown>) : obj;
 
+  const ctrlType = typeof nested.ctrlType === 'string' ? nested.ctrlType : '';
+  const usn = typeof nested.usn === 'string' ? nested.usn : '';
+  const modelId = nested.modelId ?? nested.model_id ?? null;
   const modelStr = String(nested.model ?? nested.machine_name ?? nested.device_type ?? '');
   const nameStr = String(nested.name ?? nested.device_name ?? modelStr ?? '');
-  const sn = nested.cn ?? nested.sn ?? nested.device_id ?? nested.id ?? null;
+  const rawSn = nested.cn ?? nested.sn ?? nested.device_id ?? nested.id ?? null;
+  const sn = rawSn !== null && rawSn !== undefined && String(rawSn).trim() ? String(rawSn).trim() : null;
   const fw = nested.firmware ?? nested.firmware_version ?? nested.version ?? null;
 
-  // Require at least one recognizable Anycubic / printer info field
-  if (!modelStr && !nameStr && !sn) return null;
+  // Recognize real Anycubic LAN Mode fields (`ctrlType`, `ctrlInfoUrl`, `modelId`, `usn`, `cn`, `model`)
+  const isAnycubicShape = Boolean(
+    ctrlType ||
+      nested.ctrlInfoUrl ||
+      modelId !== null ||
+      usn.toLowerCase().includes('fdm') ||
+      modelStr ||
+      nameStr ||
+      sn,
+  );
+  if (!isAnycubicShape) return null;
 
-  const lower = `${modelStr} ${nameStr}`.toLowerCase();
-  const model = lower.includes('kobra') || lower.includes('k4') ? 'kobra-x' : 'kobra-x';
+  const displayName =
+    nameStr.trim() ||
+    (modelId !== null ? `Anycubic Kobra (${modelId})` : `Anycubic Kobra (${ip.split('.').pop()})`);
 
   return {
     ip,
     brand: 'anycubic',
-    model,
-    name: nameStr.trim() || `Anycubic ${modelStr || 'Kobra X'}`,
-    serialNumber: typeof sn === 'string' && sn.trim() ? sn.trim() : null,
+    model: 'kobra-x',
+    name: displayName,
+    serialNumber: sn,
     firmware: typeof fw === 'string' && fw.trim() ? fw.trim() : null,
     protocol: 'anycubic-lan-http',
   };
@@ -169,7 +203,7 @@ export class LanDiscoveryService {
 
     const [elegooPrinters, anycubicPrinters] = await Promise.all([
       this.scanElegooSdcp(prefixes, timeoutMs),
-      this.scanAnycubicLanHttp(prefixes, Math.min(timeoutMs, 2600)),
+      this.scanAnycubicLanHttp(prefixes, Math.max(timeoutMs, 4200)),
     ]);
 
     const byIp = new Map<string, DiscoveredPrinter>();
@@ -241,6 +275,24 @@ export class LanDiscoveryService {
     });
   }
 
+  private probeTcpPort(ip: string, port: number, timeoutMs: number): Promise<boolean> {
+    return new Promise((resolve) => {
+      const sock = new net.Socket();
+      let settled = false;
+      const done = (ok: boolean) => {
+        if (settled) return;
+        settled = true;
+        sock.destroy();
+        resolve(ok);
+      };
+      sock.setTimeout(timeoutMs);
+      sock.once('connect', () => done(true));
+      sock.once('timeout', () => done(false));
+      sock.once('error', () => done(false));
+      sock.connect(port, ip);
+    });
+  }
+
   private async scanAnycubicLanHttp(
     prefixes: string[],
     budgetMs: number,
@@ -255,7 +307,7 @@ export class LanDiscoveryService {
     }
 
     const found: DiscoveredPrinter[] = [];
-    const concurrency = 32;
+    const concurrency = 64;
     let cursor = 0;
 
     const worker = async () => {
@@ -264,14 +316,32 @@ export class LanDiscoveryService {
         try {
           const res = await fetch(`http://${ip}:18910/info`, {
             method: 'GET',
-            signal: AbortSignal.timeout(280),
+            signal: AbortSignal.timeout(500),
           });
-          if (!res.ok) continue;
-          const json = await res.json().catch(() => null);
-          const parsed = parseAnycubicInfoResponse(json, ip);
-          if (parsed) found.push(parsed);
+          if (res.ok) {
+            const json = await res.json().catch(() => null);
+            const parsed = parseAnycubicInfoResponse(json, ip);
+            if (parsed) {
+              found.push(parsed);
+              continue;
+            }
+          }
+          // Some Anycubic Kobra firmwares return 401/403/404 on unauthenticated /info
+          // while still running LAN Mode on :18910 + mTLS MQTT :9883.
+          const hasMqtt9883 = await this.probeTcpPort(ip, 9883, 350);
+          if (hasMqtt9883) {
+            found.push({
+              ip,
+              brand: 'anycubic',
+              model: 'kobra-x',
+              name: `Anycubic LAN (${ip.split('.').pop()})`,
+              serialNumber: null,
+              firmware: null,
+              protocol: 'anycubic-lan-http',
+            });
+          }
         } catch {
-          /* host offline or port closed — expected */
+          /* host offline or :18910 closed — expected */
         }
       }
     };

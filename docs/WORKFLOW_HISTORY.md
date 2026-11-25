@@ -111,3 +111,21 @@
 - **Tests:** `npm run typecheck` + `npm test` → 7/7 test suites, 21/21 tests PASS.
 - **Security Catch:** Unit test caught that `isAllowedPrinterIp('8.8.8.10')` permitted public IPs; tightened `normalizePrivateSubnet()` to enforce strict RFC1918 private LAN ranges only so LAN discovery can never be abused as a public internet scanner.
 - **DB/N+1:** Single `prisma.printer.findMany` to tag registered vs new printers (zero N+1).
+
+---
+
+## 2026-11-25 — Elegoo Centauri Carbon (CC1) SDCP WebSocket Driver & LAN Scanner Fixes
+
+### Root Causes Diagnosed from Real Hardware Test
+1. **Elegoo CC1 vs CC2 protocol mismatch:** Discovered `Centauri Carbon` (FW `V1.6.49`) speaks **SDCP v3 over WebSocket (`ws://<ip>:3030/websocket`)**, not CC2 MQTT `:1883`.
+2. **Anycubic LAN scan missed `.207`:** Virtual Hyper-V/WSL adapter (`172.30.112.0/24`) consumed half the scan budget (`2.6s` across 508 IPs) and some Kobra firmwares return non-200 on unauthenticated `/info` while running LAN Mode on `:18910` + `:9883`.
+
+### Changes
+- Added `src/adapters/elegoo/drivers/cc1/cc1.driver.ts` (SDCP v3 WebSocket driver, camera `:3031/video`) and registered `cc1` alongside `cc2` in `ElegooAdapter`.
+- Updated `src/adapters/discovery/lan-discovery.service.ts` (+ `lan-discovery.spec.ts`):
+  - Properly distinguishes `Centauri Carbon` (`cc1`) vs `Centauri Carbon 2` (`cc2`).
+  - Filters out virtual interfaces (`vEthernet`, `WSL`, `Docker`, `Hyper-V`, `VMware`, `VirtualBox`, `Tailscale`, `ZeroTier`) and prioritizes `192.168.x` physical LANs.
+  - Increased Anycubic scan concurrency to `64`, timeout to `500ms`, budget to `4.2s`, and added TCP `:9883` fallback probe when `:18910` responds without public `/info` JSON.
+
+### Verification
+- `npm run typecheck` + `npm test` → 7/7 test suites, 21/21 tests PASS.
