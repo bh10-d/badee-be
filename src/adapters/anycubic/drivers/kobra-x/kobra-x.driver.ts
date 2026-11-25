@@ -132,6 +132,7 @@ export class AnycubicKobraXDriver extends EventEmitter implements IPrinterDriver
   private stopped = false;
   private deviceId = '';
   private modelId = '';
+  private seenTopics = new Set<string>();
   private state: UnifiedPrinterState;
 
   constructor(config: DriverInitConfig) {
@@ -327,8 +328,9 @@ export class AnycubicKobraXDriver extends EventEmitter implements IPrinterDriver
     });
 
     this.client.on('connect', () => {
-      // Subscribe broadly to `anycubic/#` so we capture all public/web/slicer/video responses
-      this.client?.subscribe('anycubic/#', { qos: 1 });
+      // Subscribe to `#` on the printer's dedicated local MQTT broker so we receive
+      // all telemetry & video stream token responses regardless of topic prefix.
+      this.client?.subscribe('#', { qos: 1 });
       this.setConnectionState('connected');
       this.state.workState = 'idle';
       this.state.statusText = 'Idle';
@@ -479,9 +481,34 @@ export class AnycubicKobraXDriver extends EventEmitter implements IPrinterDriver
   }
 
   private handleMessage(topic: string, payload: Buffer): void {
+    const rawStr = payload.toString('utf8');
+    if (this.seenTopics.size < 6 && !this.seenTopics.has(topic)) {
+      this.seenTopics.add(topic);
+      this.emit('event', {
+        level: 'info',
+        type: 'mqtt_topic',
+        message: `MQTT [${topic}]: ${rawStr.slice(0, 140)}`,
+      });
+    }
+
+    // Auto-discover dynamic Kobra X `/live/<short_token>` path from any MQTT payload
+    const livePathMatch = /\/live\/[A-Za-z0-9_-]{4,32}/.exec(rawStr);
+    if (livePathMatch && !this.cameraOverride) {
+      const nextUrl = `http://${this.ip}:18088${livePathMatch[0]}`;
+      if (this.state.camera.streamUrl !== nextUrl) {
+        this.state.camera = { available: true, streamUrl: nextUrl, protocol: 'flv' };
+        this.emit('event', {
+          level: 'info',
+          type: 'camera_url',
+          message: `Kobra X dynamic FLV stream detected: ${nextUrl}`,
+        });
+        this.emitState();
+      }
+    }
+
     let msg: Record<string, unknown>;
     try {
-      msg = JSON.parse(payload.toString()) as Record<string, unknown>;
+      msg = JSON.parse(rawStr) as Record<string, unknown>;
     } catch {
       return;
     }
