@@ -143,9 +143,7 @@ export class AnycubicKobraXDriver extends EventEmitter implements IPrinterDriver
     this.deviceId = this.creds.deviceId ?? config.serialNumber ?? '';
     this.modelId = this.creds.modelId ?? '';
 
-    const defaultCam = this.creds.lanToken
-      ? `http://${this.ip}:18088/live/${encodeURIComponent(this.creds.lanToken)}`
-      : null;
+    const defaultCam = `http://${this.ip}:18088/flv`;
 
     this.state = {
       printerId: this.printerId,
@@ -233,7 +231,7 @@ export class AnycubicKobraXDriver extends EventEmitter implements IPrinterDriver
             if (!this.cameraOverride) {
               this.state.camera = {
                 available: true,
-                streamUrl: `http://${this.ip}:18088/live/${encodeURIComponent(info.token)}`,
+                streamUrl: `http://${this.ip}:18088/flv`,
                 protocol: 'flv',
               };
             }
