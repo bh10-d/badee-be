@@ -1,0 +1,35 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: printfarm-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-printfarm}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-printfarm_dev_secret}
+      POSTGRES_DB: ${POSTGRES_DB:-printfarm}
+    ports:
+      - "${POSTGRES_BIND:-127.0.0.1}:${POSTGRES_PORT:-6432}:5432"
+    volumes:
+      - printfarm-pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-printfarm} -d ${POSTGRES_DB:-printfarm}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  mediamtx:
+    image: bluenviron/mediamtx:latest
+    container_name: printfarm-mediamtx
+    restart: unless-stopped
+    environment:
+      MTX_API: "yes"
+      MTX_APIADDRESS: ":9997"
+      MTX_HLSADDRESS: ":8888"
+      MTX_WEBRTCADDRESS: ":8889"
+    ports:
+      - "${MEDIAMTX_BIND:-127.0.0.1}:${MEDIAMTX_API_PORT:-6997}:9997"
+      - "${MEDIAMTX_BIND:-127.0.0.1}:${MEDIAMTX_HLS_PORT:-6888}:8888"
+      - "${MEDIAMTX_BIND:-127.0.0.1}:${MEDIAMTX_WEBRTC_PORT:-6889}:8889"
+
+volumes:
+  printfarm-pgdata:

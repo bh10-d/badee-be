@@ -1,0 +1,211 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum PrinterBrand {
+  elegoo
+  anycubic
+}
+
+enum PrinterMode {
+  pool
+  rental
+  maintenance
+}
+
+enum BedStatus {
+  clean
+  dirty
+  unknown
+}
+
+enum PrintJobStatus {
+  queued
+  dispatched
+  printing
+  paused
+  completed
+  failed
+  cancelled
+}
+
+enum EventLevel {
+  info
+  warn
+  error
+}
+
+enum OrderPriority {
+  normal
+  express
+}
+
+enum OrderStatus {
+  quoted
+  paid
+  queued
+  printing
+  completed
+  cancelled
+}
+
+enum UserRole {
+  admin
+  operator
+  renter
+}
+
+enum RentalStatus {
+  scheduled
+  active
+  expired
+  revoked
+}
+
+model Printer {
+  id                   String       @id @default(cuid())
+  name                 String       @db.VarChar(80)
+  brand                PrinterBrand
+  model                String       @db.VarChar(40)
+  ip                   String       @unique @db.VarChar(45)
+  /// AES-256-GCM encrypted JSON blob (access code, LAN token, etc.). Never returned in API responses.
+  credentialsEncrypted String?      @db.Text
+  serialNumber         String?      @db.VarChar(64)
+  cameraUrl            String?      @db.VarChar(255)
+  mode                 PrinterMode  @default(pool)
+  bedStatus            BedStatus    @default(unknown)
+  isEnabled            Boolean      @default(true)
+  createdAt            DateTime     @default(now())
+  updatedAt            DateTime     @updatedAt
+
+  jobs    PrintJob[]
+  events  PrinterEvent[]
+  rentals RentalSession[]
+
+  @@index([brand, model])
+  @@index([mode, bedStatus])
+  @@index([isEnabled])
+}
+
+model PrintJob {
+  id            String         @id @default(cuid())
+  printerId     String?
+  filename      String         @db.VarChar(255)
+  storagePath   String?        @db.VarChar(512)
+  status        PrintJobStatus @default(queued)
+  priority      Int            @default(0)
+  estimatedSec  Int?
+  filamentGrams Float?
+  errorMessage  String?        @db.VarChar(512)
+  startedAt     DateTime?
+  finishedAt    DateTime?
+  createdAt     DateTime       @default(now())
+  updatedAt     DateTime       @updatedAt
+
+  printer Printer? @relation(fields: [printerId], references: [id], onDelete: SetNull)
+
+  @@index([printerId, status, priority(sort: Desc), createdAt(sort: Asc)])
+  @@index([status, createdAt(sort: Asc)])
+}
+
+model PrinterEvent {
+  id        String     @id @default(cuid())
+  printerId String
+  level     EventLevel @default(info)
+  type      String     @db.VarChar(64)
+  message   String     @db.VarChar(512)
+  payload   Json?
+  createdAt DateTime   @default(now())
+
+  printer Printer @relation(fields: [printerId], references: [id], onDelete: Cascade)
+
+  @@index([printerId, createdAt(sort: Desc)])
+  @@index([level, createdAt(sort: Desc)])
+}
+
+model FilamentMaterial {
+  id              String   @id @default(cuid())
+  code            String   @unique @db.VarChar(32)
+  name            String   @db.VarChar(80)
+  pricePerGramVnd Int
+  densityGcm3     Float    @default(1.24)
+  colorHex        String   @default("#2f81f7") @db.VarChar(16)
+  stockGrams      Float    @default(1000)
+  isActive        Boolean  @default(true)
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  orders PrintOrder[]
+
+  @@index([isActive, code])
+}
+
+model PrintOrder {
+  id             String        @id @default(cuid())
+  orderCode      String        @unique @db.VarChar(32)
+  customerName   String        @db.VarChar(100)
+  customerEmail  String        @db.VarChar(160)
+  customerPhone  String?       @db.VarChar(32)
+  filename       String        @db.VarChar(255)
+  materialId     String
+  quantity       Int           @default(1)
+  priority       OrderPriority @default(normal)
+  estimatedGrams Float
+  estimatedSec   Int
+  unitPriceVnd   Int
+  totalPriceVnd  Int
+  status         OrderStatus   @default(quoted)
+  notes          String?       @db.VarChar(500)
+  createdAt      DateTime      @default(now())
+  updatedAt      DateTime      @updatedAt
+
+  material FilamentMaterial @relation(fields: [materialId], references: [id], onDelete: Restrict)
+
+  @@index([status, createdAt(sort: Desc)])
+  @@index([customerEmail, createdAt(sort: Desc)])
+  @@index([materialId])
+}
+
+model User {
+  id           String   @id @default(cuid())
+  email        String   @unique @db.VarChar(160)
+  name         String   @db.VarChar(100)
+  passwordHash String   @db.Text
+  role         UserRole @default(renter)
+  isActive     Boolean  @default(true)
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  rentals RentalSession[]
+
+  @@index([role, isActive])
+}
+
+model RentalSession {
+  id               String       @id @default(cuid())
+  printerId        String
+  renterId         String
+  status           RentalStatus @default(active)
+  startsAt         DateTime
+  endsAt           DateTime
+  maxNozzleTemp    Int          @default(260)
+  maxBedTemp       Int          @default(100)
+  allowPauseResume Boolean      @default(true)
+  allowStop        Boolean      @default(true)
+  allowTempControl Boolean      @default(false)
+  allowHome        Boolean      @default(false)
+  allowLight       Boolean      @default(true)
+  createdAt        DateTime     @default(now())
+  updatedAt        DateTime     @updatedAt
+
+  printer Printer @relation(fields: [printerId], references: [id], onDelete: Cascade)
+  renter  User    @relation(fields: [renterId], references: [id], onDelete: Cascade)
+
+  @@index([renterId, status, endsAt])
+  @@index([printerId, status, endsAt])
+}
