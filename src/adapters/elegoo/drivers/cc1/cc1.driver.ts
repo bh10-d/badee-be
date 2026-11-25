@@ -204,9 +204,13 @@ export class ElegooCc1Driver extends EventEmitter implements IPrinterDriver {
   }
 
   async setLight(on: boolean): Promise<void> {
-    this.sendSdcp(403, { LightStatus: { SecondLight: on ? 1 : 0, RgbLight: [0, 0, 0] } });
+    this.sendSdcp(403, { LightStatus: { SecondLight: on, RgbLight: [0, 0, 0] } });
     this.state.lightOn = on;
     this.emitState();
+  }
+
+  async setSpeedMode(mode: 50 | 100 | 130 | 160): Promise<void> {
+    this.sendSdcp(403, { PrintSpeedPct: mode });
   }
 
   async home(axes: 'all' | 'xy' | 'z' = 'all'): Promise<void> {
@@ -234,7 +238,7 @@ export class ElegooCc1Driver extends EventEmitter implements IPrinterDriver {
       throw new Error(`Elegoo CC1 (${this.ip}) is not connected`);
     }
     const payload = {
-      Id: randomUUID(),
+      Id: this.sn || '',
       Data: {
         Cmd: cmd,
         Data: data,
@@ -243,6 +247,7 @@ export class ElegooCc1Driver extends EventEmitter implements IPrinterDriver {
         TimeStamp: Math.floor(Date.now() / 1000),
         From: 0,
       },
+      Topic: `sdcp/request/${this.sn}`,
     };
     this.ws.send(JSON.stringify(payload));
   }
@@ -255,12 +260,14 @@ export class ElegooCc1Driver extends EventEmitter implements IPrinterDriver {
       return;
     }
 
+    const topicStr = typeof msg.Topic === 'string' ? msg.Topic : '';
+    const topicId = topicStr.startsWith('sdcp/') ? topicStr.split('/')[2] ?? '' : '';
     const mainboardId =
-      typeof msg.MainboardID === 'string'
-        ? msg.MainboardID
-        : typeof (msg.Attributes as Record<string, unknown> | undefined)?.MainboardID === 'string'
-          ? String((msg.Attributes as Record<string, unknown>).MainboardID)
-          : '';
+      (typeof msg.MainboardID === 'string' && msg.MainboardID) ||
+      (typeof (msg.Attributes as Record<string, unknown> | undefined)?.MainboardID === 'string'
+        ? String((msg.Attributes as Record<string, unknown>).MainboardID)
+        : '') ||
+      topicId;
     if (mainboardId && mainboardId !== this.sn) {
       this.sn = mainboardId;
       this.state.serialNumber = mainboardId;
@@ -293,8 +300,12 @@ export class ElegooCc1Driver extends EventEmitter implements IPrinterDriver {
     this.state.statusText = mapped.text;
 
     const lightObj = status.LightStatus as Record<string, unknown> | undefined;
-    if (lightObj && typeof lightObj.SecondLight === 'number') {
-      this.state.lightOn = lightObj.SecondLight > 0;
+    if (lightObj) {
+      if (typeof lightObj.SecondLight === 'boolean') {
+        this.state.lightOn = lightObj.SecondLight;
+      } else if (typeof lightObj.SecondLight === 'number') {
+        this.state.lightOn = lightObj.SecondLight > 0;
+      }
     }
 
     const fanObj = status.CurrentFanSpeed as Record<string, unknown> | undefined;
