@@ -327,18 +327,29 @@ export class AnycubicKobraXDriver extends EventEmitter implements IPrinterDriver
     });
 
     this.client.on('connect', () => {
-      const prefix =
-        this.modelId && this.deviceId
-          ? `anycubic/anycubicCloud/v1/printer/public/${this.modelId}/${this.deviceId}/#`
-          : 'anycubic/#';
-      this.client?.subscribe(prefix, { qos: 1 });
+      // Subscribe broadly to `anycubic/#` so we capture all public/web/slicer/video responses
+      this.client?.subscribe('anycubic/#', { qos: 1 });
       this.setConnectionState('connected');
       this.state.workState = 'idle';
       this.state.statusText = 'Idle';
       this.emitState();
-      // Request initial telemetry & enable local FLV camera stream on LAN
+      // Request initial telemetry & wake up local camera stream on both slicer & web topics
       this.publishControl('info', 'query', {});
       this.publishControl('video', 'startCapture', {});
+      if (this.modelId && this.deviceId) {
+        const webVideoTopic = `anycubic/anycubicCloud/v1/web/printer/${this.modelId}/${this.deviceId}/video`;
+        this.client?.publish(
+          webVideoTopic,
+          JSON.stringify({
+            type: 'video',
+            action: 'startCapture',
+            timestamp: Date.now(),
+            msgid: randomBytes(8).toString('hex'),
+            data: {},
+          }),
+          { qos: 1 },
+        );
+      }
       this.emit('event', {
         level: 'info',
         type: 'connected',
@@ -467,7 +478,7 @@ export class AnycubicKobraXDriver extends EventEmitter implements IPrinterDriver
     this.client.publish(topic, JSON.stringify(payload), { qos: 1 });
   }
 
-  private handleMessage(_topic: string, payload: Buffer): void {
+  private handleMessage(topic: string, payload: Buffer): void {
     let msg: Record<string, unknown>;
     try {
       msg = JSON.parse(payload.toString()) as Record<string, unknown>;
@@ -476,6 +487,34 @@ export class AnycubicKobraXDriver extends EventEmitter implements IPrinterDriver
     }
 
     const data = (msg.data as Record<string, unknown> | undefined) ?? msg;
+
+    // Capture dynamic camera URL returned by Kobra X in response to `video/startCapture`
+    if (topic.includes('video') || msg.type === 'video') {
+      const urls = (data.urls as Record<string, unknown> | undefined) ?? data;
+      const flvUrl =
+        typeof urls.flvUrl === 'string'
+          ? urls.flvUrl
+          : typeof urls.httpUrl === 'string'
+            ? urls.httpUrl
+            : typeof urls.url === 'string' && urls.url.startsWith('http')
+              ? urls.url
+              : null;
+      const rtspUrl = typeof urls.rtspUrl === 'string' ? urls.rtspUrl : null;
+      if (flvUrl && !this.cameraOverride) {
+        this.state.camera = { available: true, streamUrl: flvUrl, protocol: 'flv' };
+        this.emit('event', {
+          level: 'info',
+          type: 'camera_url',
+          message: `Kobra X FLV camera stream announced: ${flvUrl}`,
+        });
+      } else if (rtspUrl) {
+        this.emit('event', {
+          level: 'info',
+          type: 'camera_rtsp',
+          message: `Kobra X announced RTSP camera URL (requires MediaMTX bridge): ${rtspUrl}`,
+        });
+      }
+    }
     const rawState = String(msg.state ?? data.state ?? '').toLowerCase();
 
     let workState: PrinterWorkState = this.state.workState;
