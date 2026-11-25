@@ -122,9 +122,10 @@ export class ElegooCc1Driver extends EventEmitter implements IPrinterDriver {
       this.state.statusText = 'Idle';
       this.emitState();
 
-      // Request initial status (Cmd: 0) & attributes (Cmd: 1)
+      // Request initial status (Cmd: 0), attributes (Cmd: 1), and enable MJPEG camera stream (Cmd: 386)
       this.sendSdcp(0, {});
       this.sendSdcp(1, {});
+      this.sendSdcp(386, { Enable: 1 });
 
       this.pingTimer = setInterval(() => {
         if (this.ws?.readyState === WebSocket.OPEN) {

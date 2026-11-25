@@ -513,4 +513,43 @@ export class PrintersService {
       remainingRentalSec,
     });
   }
+
+  /**
+   * Resolves & authorizes the upstream LAN camera stream URL for a printer
+   * so the controller can proxy MJPEG/FLV safely without exposing LAN IPs or hitting CORS.
+   */
+  async resolveCameraStream(
+    id: string,
+    user: AuthTokenPayload,
+  ): Promise<{ streamUrl: string; protocol: 'mjpeg' | 'flv' | 'webrtc' | 'none' }> {
+    const printer = await this.prisma.printer.findUnique({
+      where: { id },
+      select: { id: true, ip: true, cameraUrl: true, isEnabled: true },
+    });
+    if (!printer || !printer.isEnabled) {
+      throw new NotFoundException(`Printer ${id} not found or disabled`);
+    }
+
+    if (user.role === 'renter') {
+      const session = await this.rentalPolicy.getActiveSessionForRenterPrinter(user.sub, id);
+      if (!session) {
+        throw new ForbiddenException('You do not have an active rental session for this printer');
+      }
+    }
+
+    const live = this.registry.getState(id);
+    const streamUrl = live?.camera.streamUrl ?? printer.cameraUrl;
+    const protocol = live?.camera.protocol ?? 'mjpeg';
+    if (!streamUrl) {
+      throw new NotFoundException('Camera stream is unavailable for this printer');
+    }
+
+    // Strict SSRF check: upstream URL must target the printer's own IP
+    const safeUrl = validateCameraUrlForPrinter(streamUrl, printer.ip);
+    if (!safeUrl) {
+      throw new BadRequestException('Invalid camera stream URL');
+    }
+
+    return { streamUrl: safeUrl, protocol };
+  }
 }

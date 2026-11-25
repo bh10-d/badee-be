@@ -1,6 +1,22 @@
-import { Body, Controller, Delete, Get, Param, Patch, Post } from '@nestjs/common';
-import { CurrentUser, Roles } from '../auth/auth.decorators';
-import type { AuthTokenPayload } from '../auth/token.util';
+import {
+  Body,
+  Controller,
+  Delete,
+  Get,
+  Param,
+  Patch,
+  Post,
+  Query,
+  Req,
+  Res,
+  UnauthorizedException,
+} from '@nestjs/common';
+import type { Request, Response } from 'express';
+import * as http from 'node:http';
+import * as https from 'node:https';
+import { CurrentUser, Public, Roles } from '../auth/auth.decorators';
+import { type AuthTokenPayload, verifyToken } from '../auth/token.util';
+import { getEnv } from '../config/env';
 import { RateLimit } from '../common/rate-limit.guard';
 import { PrintersService } from './printers.service';
 
@@ -65,6 +81,55 @@ export class PrintersController {
     @CurrentUser() user: AuthTokenPayload,
   ) {
     return this.printers.validateGcode(id, body, user);
+  }
+
+  @Public()
+  @Get(':id/camera-stream')
+  async streamCamera(
+    @Param('id') id: string,
+    @Query('token') queryToken: string | undefined,
+    @Req() req: Request,
+    @Res() res: Response,
+  ) {
+    const authHeader = req.headers.authorization ?? '';
+    const bearer = authHeader.startsWith('Bearer ') ? authHeader.slice(7).trim() : '';
+    const rawToken = bearer || (queryToken ?? '').trim();
+    const user = rawToken ? verifyToken(rawToken, getEnv().JWT_SECRET) : null;
+    if (!user) {
+      throw new UnauthorizedException('Invalid or missing camera stream token');
+    }
+
+    const { streamUrl } = await this.printers.resolveCameraStream(id, user);
+    const client = streamUrl.startsWith('https://') ? https : http;
+
+    const upstream = client.get(
+      streamUrl,
+      { timeout: 10_000, rejectUnauthorized: false },
+      (upstreamRes) => {
+        if (!upstreamRes.statusCode || upstreamRes.statusCode >= 400) {
+          res.status(upstreamRes.statusCode ?? 502).end('Camera stream unavailable');
+          upstreamRes.resume();
+          return;
+        }
+        const contentType = upstreamRes.headers['content-type'] ?? 'application/octet-stream';
+        res.setHeader('Content-Type', contentType);
+        res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate');
+        res.setHeader('X-Accel-Buffering', 'no');
+        upstreamRes.pipe(res);
+      },
+    );
+
+    upstream.on('error', () => {
+      if (!res.headersSent) {
+        res.status(502).end('Upstream camera unreachable');
+      } else {
+        res.end();
+      }
+    });
+
+    req.on('close', () => {
+      upstream.destroy();
+    });
   }
 
   @Roles('admin')

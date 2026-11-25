@@ -335,6 +335,12 @@ export class AnycubicKobraXDriver extends EventEmitter implements IPrinterDriver
           : 'anycubic/#';
       this.client?.subscribe(prefix, { qos: 1 });
       this.setConnectionState('connected');
+      this.state.workState = 'idle';
+      this.state.statusText = 'Idle';
+      this.emitState();
+      // Request initial telemetry & enable local FLV camera stream on LAN
+      this.publishControl('info', 'query', {});
+      this.publishControl('video', 'startCapture', {});
       this.emit('event', {
         level: 'info',
         type: 'connected',
